@@ -3,18 +3,23 @@
 Discord Emoji Optimizer
 Watches a folder for new images and automatically optimizes them for Discord emojis.
 
+Features:
+- Removes background automatically (keeps only the subject)
+- Resizes to 128x128 max
+- Compresses to under 256KB
+
 Discord emoji requirements:
 - Max size: 256KB
 - Max dimensions: 128x128 pixels
 - Formats: PNG, JPG, GIF
 """
 
-import os
-import sys
+import io
 import time
-import shutil
 from pathlib import Path
+from typing import Optional
 from PIL import Image
+from rembg import remove
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -32,9 +37,24 @@ def ensure_folders():
     OUTPUT_FOLDER.mkdir(exist_ok=True)
 
 
-def optimize_image(input_path: Path) -> Path | None:
+def remove_background(img: Image.Image) -> Image.Image:
+    """Remove the background from an image, keeping only the subject."""
+    # Convert to bytes for rembg
+    img_byte_arr = io.BytesIO()
+    img.save(img_byte_arr, format='PNG')
+    img_byte_arr.seek(0)
+
+    # Remove background
+    output_bytes = remove(img_byte_arr.getvalue())
+
+    # Convert back to PIL Image
+    return Image.open(io.BytesIO(output_bytes))
+
+
+def optimize_image(input_path: Path) -> Optional[Path]:
     """
     Optimize an image for Discord emoji use.
+    Removes background, resizes, and compresses.
     Returns the output path if successful, None otherwise.
     """
     try:
@@ -42,45 +62,33 @@ def optimize_image(input_path: Path) -> Path | None:
 
         # Open the image
         with Image.open(input_path) as img:
-            # Handle animated GIFs
+            # Handle animated GIFs differently
             is_animated = getattr(img, 'is_animated', False)
 
             if is_animated:
                 return optimize_animated_gif(input_path)
 
-            # Convert to RGBA if necessary (for transparency support)
-            if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
+            # Convert to RGBA for processing
+            if img.mode != 'RGBA':
                 img = img.convert('RGBA')
-                output_format = 'PNG'
-                output_ext = '.png'
-            else:
-                img = img.convert('RGB')
-                output_format = 'PNG'
-                output_ext = '.png'
+
+            # Remove background
+            print(f"  Removing background...")
+            img = remove_background(img)
 
             # Resize to fit within 128x128 while maintaining aspect ratio
             img.thumbnail(MAX_DIMENSIONS, Image.Resampling.LANCZOS)
 
-            # Create output path
-            output_path = OUTPUT_FOLDER / f"{input_path.stem}_emoji{output_ext}"
+            # Create output path (always PNG for transparency)
+            output_path = OUTPUT_FOLDER / f"{input_path.stem}_emoji.png"
 
-            # Save with compression, adjusting quality to meet size requirement
-            if output_format == 'PNG':
-                # Try saving as PNG first
-                img.save(output_path, format='PNG', optimize=True)
+            # Save with compression
+            img.save(output_path, format='PNG', optimize=True)
 
-                # If too large, try reducing colors or switching to JPEG
-                if output_path.stat().st_size > MAX_SIZE_BYTES:
-                    # Try quantizing to reduce file size
-                    if img.mode == 'RGBA':
-                        img_quantized = img.quantize(colors=256, method=Image.Mediancut, dither=Image.Dither.FLOYDSTEINBERG)
-                        img_quantized.save(output_path, format='PNG', optimize=True)
-
-                    # If still too large, convert to JPEG (loses transparency)
-                    if output_path.stat().st_size > MAX_SIZE_BYTES:
-                        output_path = OUTPUT_FOLDER / f"{input_path.stem}_emoji.jpg"
-                        img_rgb = img.convert('RGB')
-                        save_with_size_limit(img_rgb, output_path, 'JPEG')
+            # If too large, try reducing colors
+            if output_path.stat().st_size > MAX_SIZE_BYTES:
+                img_quantized = img.quantize(colors=256, method=Image.Mediancut, dither=Image.Dither.FLOYDSTEINBERG)
+                img_quantized.save(output_path, format='PNG', optimize=True)
 
             file_size = output_path.stat().st_size
             print(f"  Saved: {output_path.name} ({file_size / 1024:.1f}KB)")
@@ -91,19 +99,29 @@ def optimize_image(input_path: Path) -> Path | None:
         return None
 
 
-def optimize_animated_gif(input_path: Path) -> Path | None:
-    """Optimize an animated GIF for Discord."""
+def optimize_animated_gif(input_path: Path) -> Optional[Path]:
+    """Optimize an animated GIF for Discord (background removal on each frame)."""
     try:
         output_path = OUTPUT_FOLDER / f"{input_path.stem}_emoji.gif"
+        print(f"  Processing animated GIF...")
 
         with Image.open(input_path) as img:
             frames = []
             durations = []
 
+            frame_count = 0
             try:
                 while True:
-                    # Resize each frame
-                    frame = img.copy()
+                    frame_count += 1
+                    print(f"  Processing frame {frame_count}...")
+
+                    # Get frame and convert to RGBA
+                    frame = img.copy().convert('RGBA')
+
+                    # Remove background from frame
+                    frame = remove_background(frame)
+
+                    # Resize frame
                     frame.thumbnail(MAX_DIMENSIONS, Image.Resampling.LANCZOS)
                     frames.append(frame)
                     durations.append(img.info.get('duration', 100))
@@ -119,13 +137,13 @@ def optimize_animated_gif(input_path: Path) -> Path | None:
                     append_images=frames[1:],
                     duration=durations,
                     loop=img.info.get('loop', 0),
-                    optimize=True
+                    optimize=True,
+                    disposal=2  # Clear frame before rendering next
                 )
 
-                # If still too large, reduce frames or colors
+                # If still too large, reduce frames
                 if output_path.stat().st_size > MAX_SIZE_BYTES:
-                    # Try reducing frame count
-                    reduced_frames = frames[::2]  # Take every other frame
+                    reduced_frames = frames[::2]
                     reduced_durations = [d * 2 for d in durations[::2]]
 
                     reduced_frames[0].save(
@@ -134,7 +152,8 @@ def optimize_animated_gif(input_path: Path) -> Path | None:
                         append_images=reduced_frames[1:],
                         duration=reduced_durations,
                         loop=img.info.get('loop', 0),
-                        optimize=True
+                        optimize=True,
+                        disposal=2
                     )
 
                 file_size = output_path.stat().st_size
@@ -144,17 +163,6 @@ def optimize_animated_gif(input_path: Path) -> Path | None:
     except Exception as e:
         print(f"  Error processing animated GIF {input_path.name}: {e}")
         return None
-
-
-def save_with_size_limit(img: Image.Image, output_path: Path, format: str):
-    """Save image, reducing quality until it fits under the size limit."""
-    quality = 95
-
-    while quality > 10:
-        img.save(output_path, format=format, quality=quality, optimize=True)
-        if output_path.stat().st_size <= MAX_SIZE_BYTES:
-            break
-        quality -= 5
 
 
 class ImageHandler(FileSystemEventHandler):
@@ -203,6 +211,8 @@ def main():
     print("=" * 50)
     print(f"Input folder:  {INPUT_FOLDER.absolute()}")
     print(f"Output folder: {OUTPUT_FOLDER.absolute()}")
+    print("-" * 50)
+    print("Features: Background removal + Resize + Compress")
     print("-" * 50)
 
     # Process existing files first
